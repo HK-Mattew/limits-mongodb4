@@ -15,6 +15,12 @@ from .base import MovingWindowSupport, Storage
 if TYPE_CHECKING:
     import pymongo
 
+from pymongo import (
+    WriteConcern,
+    ReadPreference
+)
+from pymongo.read_concern import ReadConcern
+
 
 @versionadded(version="2.1")
 class MongoDBStorage(Storage, MovingWindowSupport):
@@ -123,38 +129,75 @@ class MongoDBStorage(Storage, MovingWindowSupport):
         :param expiry: amount in seconds for the key to expire in
         :param amount: the number to increment by
         """
-        expiration = datetime.datetime.utcnow() + datetime.timedelta(seconds=expiry)
 
-        return int(
-            self.counters.find_one_and_update(
-                {"_id": key},
-                [
-                    {
-                        "$set": {
-                            "count": {
-                                "$cond": {
-                                    "if": {"$lt": ["$expireAt", "$$NOW"]},
-                                    "then": amount,
-                                    "else": {"$add": ["$count", amount]},
-                                }
-                            },
-                            "expireAt": {
-                                "$cond": {
-                                    "if": {"$lt": ["$expireAt", "$$NOW"]},
-                                    "then": expiration,
-                                    "else": (
-                                        expiration if elastic_expiry else "$expireAt"
-                                    ),
-                                }
-                            },
-                        }
-                    },
-                ],
+        utcnow = datetime.datetime.utcnow()
+        expiration = utcnow + datetime.timedelta(seconds=expiry)
+
+
+        def session_callback(session):
+
+            query_match = {'_id': key}
+            query_update = {
+                '$setOnInsert': {
+                    'count': amount,
+                    'expireAt': expiration
+                }
+            }
+
+            resultDoc = self.counters.find_one(query_match, session=session)
+
+
+            if resultDoc is not None:
+
+                if resultDoc['expireAt'] < utcnow:
+
+                    query_update.setdefault('$set', {})
+
+                    query_match['count'] = resultDoc['count'] #Make Update atomic.
+                    query_update['$set']['count'] = amount #Set count.
+                    del query_update['$setOnInsert']['count'] #Remove count on insert.
+
+                    query_match['expireAt'] = resultDoc['expireAt'] #Make Update atomic.
+                    query_update['$set']['expireAt'] = expiration #Set expireAt.
+                    del query_update['$setOnInsert']['expireAt'] #Remove expireAt on insert.
+                else:
+
+                    query_update.setdefault('$inc', {})
+
+                    query_match['count'] = resultDoc['count'] #Make Update atomic.
+                    query_update['$inc']['count'] = amount #Inc count.
+                    del query_update['$setOnInsert']['count'] #Remove count on insert.
+
+                    #Set expireAt
+                    if elastic_expiry:
+                        query_update.setdefault('$set', {})
+                        query_match['expireAt'] = resultDoc['expireAt'] #Make Update atomic.
+                        query_update['$set']['expireAt'] = expiration #Set expireAt.
+                        del query_update['$setOnInsert']['expireAt'] #Remove expireAt on insert.
+
+
+            if not query_update['$setOnInsert']:
+                del query_update['$setOnInsert']
+
+
+            result_update = self.counters.find_one_and_update(
+                query_match,
+                query_update,
+                session=session,
                 upsert=True,
                 projection=["count"],
-                return_document=self.lib.ReturnDocument.AFTER,
-            )["count"]
-        )
+                return_document=self.lib.ReturnDocument.AFTER
+            )
+            return int(result_update['count'])
+
+
+
+        wc_majority = WriteConcern("majority", wtimeout=1000)
+        with self.storage.start_session() as session:
+            return session.with_transaction(
+                session_callback, read_concern=ReadConcern('local'),
+                write_concern=wc_majority,
+                read_preference=ReadPreference.PRIMARY)
 
     def check(self) -> bool:
         """
